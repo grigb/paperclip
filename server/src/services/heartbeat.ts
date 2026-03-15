@@ -7,6 +7,7 @@ import {
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  costEvents,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
@@ -145,6 +146,12 @@ type SessionCompactionDecision = {
   previousRunId: string | null;
 };
 
+type CostContext = {
+  issueId: string | null;
+  projectId: string | null;
+  goalId: string | null;
+};
+
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
@@ -231,6 +238,26 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
 function formatCount(value: number | null | undefined) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "0";
   return value.toLocaleString("en-US");
+}
+
+function isSameUtcMonth(left: Date, right: Date) {
+  return left.getUTCFullYear() === right.getUTCFullYear()
+    && left.getUTCMonth() === right.getUTCMonth();
+}
+
+export function shouldResumeBudgetPausedAgentForNewMonth(input: {
+  status: string;
+  budgetMonthlyCents: number;
+  spentMonthlyCents: number;
+  latestCostOccurredAt: Date | null;
+  now?: Date;
+}) {
+  const { status, budgetMonthlyCents, spentMonthlyCents, latestCostOccurredAt, now = new Date() } = input;
+  if (status !== "paused") return false;
+  if (budgetMonthlyCents <= 0) return false;
+  if (spentMonthlyCents < budgetMonthlyCents) return false;
+  if (!latestCostOccurredAt) return true;
+  return !isSameUtcMonth(latestCostOccurredAt, now);
 }
 
 function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
@@ -564,6 +591,51 @@ export function heartbeatService(db: Db) {
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function maybeResumeBudgetPausedAgent(agent: typeof agents.$inferSelect) {
+    const latestAgentEvent = await db
+      .select({ occurredAt: costEvents.occurredAt })
+      .from(costEvents)
+      .where(eq(costEvents.agentId, agent.id))
+      .orderBy(desc(costEvents.occurredAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    if (!shouldResumeBudgetPausedAgentForNewMonth({
+      status: agent.status,
+      budgetMonthlyCents: agent.budgetMonthlyCents,
+      spentMonthlyCents: agent.spentMonthlyCents,
+      latestCostOccurredAt: latestAgentEvent?.occurredAt ?? null,
+    })) {
+      return agent;
+    }
+
+    const resumed = await db
+      .update(agents)
+      .set({
+        status: "idle",
+        spentMonthlyCents: 0,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(agents.id, agent.id), eq(agents.status, "paused")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (resumed) {
+      publishLiveEvent({
+        companyId: resumed.companyId,
+        type: "agent.status",
+        payload: {
+          agentId: resumed.id,
+          status: resumed.status,
+          outcome: "budget_month_reset",
+        },
+      });
+      return resumed;
+    }
+
+    return (await getAgent(agent.id)) ?? agent;
   }
 
   async function getRun(runId: string) {
@@ -925,9 +997,16 @@ export function heartbeatService(db: Db) {
         `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
       );
     } else {
-      warnings.push(
-        `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
-      );
+      // Suppress the warning when the agent has cwd configured in adapterConfig.
+      // In that case the adapter will use its own cwd and the fallback is never
+      // actually used for execution, so the warning is misleading noise.
+      const agentAdapterConfig = parseObject(agent.adapterConfig);
+      const agentConfiguredCwd = readNonEmptyString(agentAdapterConfig.cwd);
+      if (!agentConfiguredCwd) {
+        warnings.push(
+          `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
+        );
+      }
     }
     return {
       cwd,
@@ -1288,6 +1367,7 @@ export function heartbeatService(db: Db) {
     result: AdapterExecutionResult,
     session: { legacySessionId: string | null },
     normalizedUsage?: UsageTotals | null,
+    costContext?: CostContext,
   ) {
     await ensureRuntimeState(agent);
     const usage = normalizedUsage ?? normalizeUsageTotals(result.usage);
@@ -1319,6 +1399,9 @@ export function heartbeatService(db: Db) {
         agentId: agent.id,
         provider: result.provider ?? "unknown",
         model: result.model ?? "unknown",
+        issueId: costContext?.issueId ?? null,
+        projectId: costContext?.projectId ?? null,
+        goalId: costContext?.goalId ?? null,
         inputTokens,
         outputTokens,
         costCents: additionalCostCents,
@@ -1402,6 +1485,7 @@ export function heartbeatService(db: Db) {
       ? await db
           .select({
             projectId: issues.projectId,
+            goalId: issues.goalId,
             assigneeAgentId: issues.assigneeAgentId,
             assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
             executionWorkspaceSettings: issues.executionWorkspaceSettings,
@@ -1421,6 +1505,13 @@ export function heartbeatService(db: Db) {
     );
     const contextProjectId = readNonEmptyString(context.projectId);
     const executionProjectId = issueAssigneeConfig?.projectId ?? contextProjectId;
+    let costContext: CostContext | null = issueId
+      ? {
+          issueId,
+          projectId: executionProjectId,
+          goalId: issueAssigneeConfig?.goalId ?? null,
+        }
+      : null;
     const projectExecutionWorkspacePolicy = executionProjectId
       ? await db
           .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
@@ -1830,7 +1921,6 @@ export function heartbeatService(db: Db) {
         rawUsage,
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
-
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
       if (latestRun?.status === "cancelled") {
@@ -1931,7 +2021,10 @@ export function heartbeatService(db: Db) {
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
-        }, normalizedUsage);
+        },
+          normalizedUsage,
+          costContext ?? undefined,
+        );
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
@@ -1997,7 +2090,10 @@ export function heartbeatService(db: Db) {
           errorMessage: message,
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
-        });
+        },
+          null,
+          costContext ?? undefined,
+        );
 
         if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
           await upsertTaskSession({
@@ -2072,6 +2168,7 @@ export function heartbeatService(db: Db) {
         .update(issues)
         .set({
           executionRunId: null,
+          checkoutRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
           updatedAt: new Date(),
@@ -2101,12 +2198,16 @@ export function heartbeatService(db: Db) {
           .where(eq(agents.id, deferred.agentId))
           .then((rows) => rows[0] ?? null);
 
+        const invokableDeferredAgent = deferredAgent
+          ? await maybeResumeBudgetPausedAgent(deferredAgent)
+          : null;
+
         if (
-          !deferredAgent ||
-          deferredAgent.companyId !== issue.companyId ||
-          deferredAgent.status === "paused" ||
-          deferredAgent.status === "terminated" ||
-          deferredAgent.status === "pending_approval"
+          !invokableDeferredAgent ||
+          invokableDeferredAgent.companyId !== issue.companyId ||
+          invokableDeferredAgent.status === "paused" ||
+          invokableDeferredAgent.status === "terminated" ||
+          invokableDeferredAgent.status === "pending_approval"
         ) {
           await tx
             .update(agentWakeupRequests)
@@ -2142,13 +2243,13 @@ export function heartbeatService(db: Db) {
           payload: promotedPayload,
         });
 
-        const sessionBefore = await resolveSessionBeforeForWakeup(deferredAgent, promotedTaskKey);
+        const sessionBefore = await resolveSessionBeforeForWakeup(invokableDeferredAgent, promotedTaskKey);
         const now = new Date();
         const newRun = await tx
           .insert(heartbeatRuns)
           .values({
-            companyId: deferredAgent.companyId,
-            agentId: deferredAgent.id,
+            companyId: invokableDeferredAgent.companyId,
+            agentId: invokableDeferredAgent.id,
             invocationSource: promotedSource,
             triggerDetail: promotedTriggerDetail,
             status: "queued",
@@ -2176,7 +2277,7 @@ export function heartbeatService(db: Db) {
           .update(issues)
           .set({
             executionRunId: newRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
+            executionAgentNameKey: normalizeAgentNameKey(invokableDeferredAgent.name),
             executionLockedAt: now,
             updatedAt: now,
           })
@@ -2223,8 +2324,9 @@ export function heartbeatService(db: Db) {
     });
     const issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
 
-    const agent = await getAgent(agentId);
-    if (!agent) throw notFound("Agent not found");
+    const existingAgent = await getAgent(agentId);
+    if (!existingAgent) throw notFound("Agent not found");
+    const agent = await maybeResumeBudgetPausedAgent(existingAgent);
 
     if (
       agent.status === "paused" ||
@@ -2318,6 +2420,7 @@ export function heartbeatService(db: Db) {
             .update(issues)
             .set({
               executionRunId: null,
+              checkoutRunId: null,
               executionAgentNameKey: null,
               executionLockedAt: null,
               updatedAt: new Date(),
@@ -2803,16 +2906,21 @@ export function heartbeatService(db: Db) {
       let skipped = 0;
 
       for (const agent of allAgents) {
-        if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
-        const policy = parseHeartbeatPolicy(agent);
+        const invokableAgent = await maybeResumeBudgetPausedAgent(agent);
+        if (
+          invokableAgent.status === "paused" ||
+          invokableAgent.status === "terminated" ||
+          invokableAgent.status === "pending_approval"
+        ) continue;
+        const policy = parseHeartbeatPolicy(invokableAgent);
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 
         checked += 1;
-        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
+        const baseline = new Date(invokableAgent.lastHeartbeatAt ?? invokableAgent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
-        const run = await enqueueWakeup(agent.id, {
+        const run = await enqueueWakeup(invokableAgent.id, {
           source: "timer",
           triggerDetail: "system",
           reason: "heartbeat_timer",
