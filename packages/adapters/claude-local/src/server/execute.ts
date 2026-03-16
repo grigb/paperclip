@@ -531,6 +531,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       } as Record<string, unknown>)
       : null;
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
+    const clearSessionForPromptTooLong = /prompt is too long/i.test(
+      asString(parsed?.result, "") + " " + (proc.stderr || "")
+    );
 
     return {
       exitCode: proc.exitCode,
@@ -552,7 +555,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
       resultJson: parsed,
       summary: parsedStream.summary || asString(parsed.result, ""),
-      clearSession: clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
+      clearSession: clearSessionForMaxTurns || clearSessionForPromptTooLong || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
     };
   };
 
