@@ -260,6 +260,21 @@ export function shouldResumeBudgetPausedAgentForNewMonth(input: {
   return !isSameUtcMonth(latestCostOccurredAt, now);
 }
 
+/**
+ * Returns a model-aware context-limit threshold (in tokens) with ~20% headroom
+ * below the actual model context window.  When an explicit override is
+ * configured in `runtimeConfig.heartbeat.sessionCompaction.maxRawInputTokens`
+ * this value is only used as the fallback default.
+ */
+function getModelContextLimit(model: string): number {
+  if (/opus/i.test(model)) return 800_000;
+  if (/sonnet/i.test(model)) return 150_000;
+  if (/haiku/i.test(model)) return 150_000;
+  if (/gemini/i.test(model)) return 800_000; // Gemini Pro has 1M+
+  if (/gpt-5/i.test(model)) return 100_000; // Conservative for GPT
+  return 150_000; // Conservative default for unknown models
+}
+
 function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
   const runtimeConfig = parseObject(agent.runtimeConfig);
   const heartbeat = parseObject(runtimeConfig.heartbeat);
@@ -271,10 +286,14 @@ function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): Sessio
     ? supportsSessions
     : asBoolean(compaction.enabled, supportsSessions);
 
+  const adapterConfig = parseObject(agent.adapterConfig);
+  const model = typeof adapterConfig.model === "string" ? adapterConfig.model : "";
+  const defaultTokenLimit = getModelContextLimit(model);
+
   return {
     enabled,
     maxSessionRuns: Math.max(0, Math.floor(asNumber(compaction.maxSessionRuns, 200))),
-    maxRawInputTokens: Math.max(0, Math.floor(asNumber(compaction.maxRawInputTokens, 2_000_000))),
+    maxRawInputTokens: Math.max(0, Math.floor(asNumber(compaction.maxRawInputTokens, defaultTokenLimit))),
     maxSessionAgeHours: Math.max(0, Math.floor(asNumber(compaction.maxSessionAgeHours, 72))),
   };
 }
@@ -800,11 +819,13 @@ export function heartbeatService(db: Db) {
     } else if (
       policy.maxRawInputTokens > 0 &&
       latestRawUsage &&
-      latestRawUsage.inputTokens >= policy.maxRawInputTokens
+      (latestRawUsage.inputTokens + latestRawUsage.cachedInputTokens) >= policy.maxRawInputTokens
     ) {
+      const sessionContextTokens = latestRawUsage.inputTokens + latestRawUsage.cachedInputTokens;
       reason =
-        `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
-        `(threshold ${formatCount(policy.maxRawInputTokens)})`;
+        `session context reached ${formatCount(sessionContextTokens)} tokens ` +
+        `(${formatCount(latestRawUsage.inputTokens)} new + ${formatCount(latestRawUsage.cachedInputTokens)} cached, ` +
+        `threshold ${formatCount(policy.maxRawInputTokens)})`;
     } else if (policy.maxSessionAgeHours > 0 && sessionAgeHours >= policy.maxSessionAgeHours) {
       reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;
     }
